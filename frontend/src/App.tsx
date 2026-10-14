@@ -2,7 +2,9 @@ import { useEffect, useState } from "react";
 import { BrainCircuit, Mic, FileText, Code2 } from "lucide-react";
 import "./App.css";
 
-const API = "http://127.0.0.1:8000";
+// const API = "http://127.0.0.1:8000";
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
 type QuestionResponse = {
   role: string;
@@ -65,7 +67,7 @@ export default function App() {
   const loadReadiness = async () => {
     try {
       const response = await fetch(
-        "http://127.0.0.1:8000/api/interview/readiness",
+        `${API_BASE_URL}/api/interview/readiness`,
       );
 
       if (!response.ok) {
@@ -85,7 +87,7 @@ export default function App() {
 
     try {
       const response = await fetch(
-        "http://127.0.0.1:8000/api/interview/history",
+        `${API_BASE_URL}/api/interview/history`,
       );
 
       if (!response.ok) {
@@ -109,7 +111,7 @@ export default function App() {
     setWeakSkillError("");
 
     try {
-      const response = await fetch(`${API}/api/interview/weak-skills`);
+      const response = await fetch(`${API_BASE_URL}/api/interview/weak-skills`);
 
       if (!response.ok) {
         throw new Error("Could not load weak-skill analysis.");
@@ -129,7 +131,7 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetch(`${API}/api/health`)
+    fetch(`${API_BASE_URL}/api/health`)
       .then((response) => {
         if (!response.ok) throw new Error("Backend unavailable");
         return response.json();
@@ -137,7 +139,7 @@ export default function App() {
       .then(() => setStatus("Backend connected"))
       .catch(() => setStatus("Backend offline"));
 
-    fetch(`${API}/api/questions`)
+    fetch(`${API_BASE_URL}/api/questions`)
       .then((response) => response.json())
       .then((data: QuestionResponse) => setQuestions(data.questions))
       .catch(() => setQuestions([]));
@@ -174,7 +176,7 @@ export default function App() {
       const formData = new FormData();
       formData.append("file", resumeFile);
 
-      const response = await fetch("http://127.0.0.1:8000/api/resume/upload", {
+      const response = await fetch(`${API_BASE_URL}/api/resume/upload`, {
         method: "POST",
         body: formData,
       });
@@ -221,7 +223,7 @@ export default function App() {
     setAnalysis(null);
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/api/resume/analyze", {
+      const response = await fetch(`${API_BASE_URL}/api/resume/analyze`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -275,7 +277,7 @@ export default function App() {
 
     try {
       const response = await fetch(
-        "http://127.0.0.1:8000/api/interview/generate",
+        `${API_BASE_URL}/api/interview/generate`,
         {
           method: "POST",
           headers: {
@@ -362,7 +364,7 @@ export default function App() {
 
     try {
       const response = await fetch(
-        "http://127.0.0.1:8000/api/interview/evaluate",
+        `${API_BASE_URL}/api/interview/evaluate`,
         {
           method: "POST",
           headers: {
@@ -390,7 +392,7 @@ export default function App() {
 
       try {
         const saveResponse = await fetch(
-          "http://127.0.0.1:8000/api/interview/history",
+          `${API_BASE_URL}/api/interview/history`,
           {
             method: "POST",
             headers: {
@@ -451,7 +453,7 @@ export default function App() {
 
     try {
       const response = await fetch(
-        `http://127.0.0.1:8000/api/interview/history/${sessionId}`,
+        `${API_BASE_URL}/api/interview/history/${sessionId}`,
       );
 
       if (!response.ok) {
@@ -1028,7 +1030,7 @@ export default function App() {
 
                         try {
                           const response = await fetch(
-                            "http://127.0.0.1:8000/api/interview/generate",
+                            `${API_BASE_URL}/api/interview/generate`,
                             {
                               method: "POST",
                               headers: {
