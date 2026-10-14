@@ -1,0 +1,980 @@
+from collections import defaultdict
+from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+import json
+import re
+import sqlite3
+
+import fitz
+from docx import Document
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Literal
+
+
+DB_PATH = Path(__file__).with_name("interviewpilot.db")
+
+
+def init_database():
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS interview_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                difficulty TEXT NOT NULL,
+                questions_json TEXT NOT NULL,
+                answers_json TEXT NOT NULL,
+                evaluation_json TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+
+init_database()
+
+app = FastAPI(
+    title="InterviewPilot AI",
+    description="Free interview preparation platform",
+    version="0.2.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def home():
+    return {"app": "InterviewPilot AI", "message": "Backend is running!"}
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "healthy", "ai_provider": "not_configured"}
+
+
+@app.get("/api/questions")
+def get_questions():
+    return {
+        "role": "Python Developer",
+        "questions": [
+            "Explain the difference between a list and a tuple.",
+            "What is a Python dictionary?",
+            "Explain exception handling in Python.",
+            "What is a REST API?",
+            "How do you connect Python to a database?",
+        ],
+    }
+
+
+@app.post("/api/resume/upload")
+async def upload_resume(file: UploadFile = File(...)):
+    filename = file.filename or ""
+    extension = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+
+    if extension not in {"pdf", "docx"}:
+        raise HTTPException(status_code=400, detail="Please upload a PDF or DOCX file.")
+
+    content = await file.read()
+
+    if len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File is too large. Maximum size is 5 MB.")
+
+    if not content:
+        raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+
+    try:
+        if extension == "pdf":
+            with fitz.open(stream=content, filetype="pdf") as pdf:
+                text = "\n".join(page.get_text() for page in pdf)
+        else:
+            document = Document(BytesIO(content))
+            text = "\n".join(paragraph.text for paragraph in document.paragraphs)
+    except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not read this file. Please check that it is a valid PDF or DOCX.",
+            )
+
+    if not text.strip():
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No readable text was found. If this is a scanned PDF, "
+                "OCR support will be needed."
+            ),
+        )
+
+    return {"filename": filename, "character_count": len(text), "text": text}
+
+
+class ResumeAnalysisRequest(BaseModel):
+    text: str = Field(min_length=20, max_length=50000)
+
+
+SKILL_KEYWORDS = [
+    "Python", "Java", "JavaScript", "TypeScript", "C++", "C#",
+    "React", "Node.js", "FastAPI", "Django", "Flask",
+    "SQL", "PostgreSQL", "MySQL", "MongoDB", "SQLite",
+    "HTML", "CSS", "Git", "Docker", "AWS", "Azure",
+    "Machine Learning", "Deep Learning", "Data Analysis",
+    "Pandas", "NumPy", "TensorFlow", "PyTorch",
+    "REST API", "Linux", "Excel", "Power BI",
+    "Communication", "Leadership", "Project Management",
+]
+
+
+def contains_keyword(text: str, keyword: str) -> bool:
+    pattern = r"(?<!\w)" + re.escape(keyword) + r"(?!\w)"
+    return bool(re.search(pattern, text, re.IGNORECASE))
+
+
+@app.post("/api/resume/analyze")
+async def analyze_resume(request: ResumeAnalysisRequest):
+    text = request.text.strip()
+    if len(text) < 20:
+        raise HTTPException(status_code=400, detail="Please provide more resume text to analyze.")
+
+    skills = [skill for skill in SKILL_KEYWORDS if contains_keyword(text, skill)]
+
+    section_patterns = {
+        "Experience": r"\b(experience|employment|work history)\b",
+        "Education": r"\b(education|academic background|qualifications)\b",
+        "Projects": r"\b(projects|personal projects|key projects)\b",
+        "Certifications": r"\b(certifications|certificates)\b",
+    }
+    sections = [
+        section for section, pattern in section_patterns.items()
+        if re.search(pattern, text, re.IGNORECASE)
+    ]
+
+    if len(skills) >= 8:
+        summary = "Your resume mentions a broad range of skills. Prepare examples that demonstrate how you applied them."
+    elif len(skills) >= 4:
+        summary = "Your resume shows several identifiable skills. Prepare practical examples and explain your contributions."
+    else:
+        summary = "Your resume has relatively few recognizable skill keywords. Consider adding specific technologies, tools, and measurable achievements where appropriate."
+
+    return {
+        "word_count": len(text.split()),
+        "skills": skills,
+        "sections_detected": sections,
+        "summary": summary,
+        "interview_focus": [
+            "Explain a project you worked on and your individual contribution.",
+            "Describe a challenging problem and how you solved it.",
+            "Give examples of how you used your listed technical skills.",
+        ],
+    }
+
+
+class InterviewRequest(BaseModel):
+    resume_text: str = Field(min_length=20, max_length=50000)
+    role: str = Field(min_length=2, max_length=100)
+    difficulty: Literal["Easy", "Medium", "Hard"] = "Medium"
+    count: int = Field(default=5, ge=3, le=10)
+    focus_category: Literal[
+        "Technical fundamentals",
+        "Problem solving and debugging",
+        "Projects and practical experience",
+        "APIs, databases, and architecture",
+        "Communication and behavioral skills",
+        "General interview skills",
+    ] | None = None
+
+
+@app.post("/api/interview/generate")
+async def generate_interview(request: InterviewRequest):
+    resume = request.resume_text.strip()
+    role = request.role.strip()
+
+    if len(resume) < 20:
+        raise HTTPException(status_code=400, detail="Please provide more resume text.")
+    if not role:
+        raise HTTPException(status_code=400, detail="Please enter a target job role.")
+
+    skills = [skill for skill in SKILL_KEYWORDS if contains_keyword(resume, skill)]
+    role_lower = role.lower()
+
+    if any(word in role_lower for word in ["frontend", "front-end", "react"]):
+        role_topics = [
+            "component design and reusable UI",
+            "state management and rendering",
+            "accessibility and responsive design",
+            "frontend performance and debugging",
+        ]
+    elif any(word in role_lower for word in ["backend", "back-end", "api"]):
+        role_topics = [
+            "API design and request validation",
+            "database design and query performance",
+            "authentication and application security",
+            "error handling and backend debugging",
+        ]
+    elif any(word in role_lower for word in ["data", "analyst"]):
+        role_topics = [
+            "data cleaning and missing values",
+            "SQL queries and data aggregation",
+            "data visualization and communicating insights",
+            "checking data quality and accuracy",
+        ]
+    elif any(word in role_lower for word in ["machine learning", "ml engineer", "ai engineer"]):
+        role_topics = [
+            "feature engineering and data preparation",
+            "model evaluation and overfitting",
+            "choosing appropriate evaluation metrics",
+            "deploying and monitoring a model",
+        ]
+    elif any(word in role_lower for word in ["python", "software", "developer", "engineer"]):
+        role_topics = [
+            "data structures and algorithm choices",
+            "writing maintainable and testable code",
+            "debugging a difficult programming problem",
+            "API design and application architecture",
+        ]
+    else:
+        role_topics = [
+            "the key responsibilities of this role",
+            "solving a challenging work problem",
+            "prioritizing tasks under time pressure",
+            "collaborating with teammates and stakeholders",
+        ]
+
+    skill_text = ", ".join(skills[:8]) if skills else "the skills relevant to this role"
+
+    focused_questions = {
+        "Technical fundamentals": [
+            f"Explain a core technical concept that matters for a {role} and give a practical example.",
+            f"What is the difference between two commonly confused concepts in {role} work?",
+            f"How would you choose an appropriate data structure or algorithm for a {role} task?",
+            f"Explain how you would test that a technical concept works as expected in a real project.",
+            f"Describe a technical trade-off you might make as a {role} and why.",
+            f"How would you explain a complex technical concept to a beginner?",
+            f"What common misconception about a technology used in {role} work would you clarify?",
+            f"How do you decide whether to use a built-in feature or implement a solution yourself?",
+            f"Describe how you would learn and validate your understanding of an unfamiliar technical concept.",
+            f"Compare two possible approaches to a common {role} task and explain when each is appropriate.",
+        ],
+        "Problem solving and debugging": [
+            f"A feature in a {role} project suddenly stops working. How would you isolate the cause?",
+            "Describe a step-by-step process for reproducing and debugging an intermittent bug.",
+            "How would you use logs, error messages, and a minimal reproduction to test a hypothesis?",
+            "A fix resolves one bug but causes another. How would you investigate and prevent regressions?",
+            "How would you debug a slow operation when you do not know the bottleneck?",
+            "What would you do if a bug cannot be reproduced consistently on your machine?",
+            "How would you prioritize multiple reported defects with different levels of impact?",
+            "How do you verify that a bug is fixed rather than merely hidden?",
+            "Describe how you would narrow down whether a failure comes from data, code, or configuration.",
+            "After resolving a production issue, what follow-up actions would help prevent recurrence?",
+        ],
+        "Projects and practical experience": [
+            "Walk through a project you worked on, its goal, and your individual contribution.",
+            "Describe the hardest technical challenge in a project and how you addressed it.",
+            "What alternatives did you consider when making an important project decision?",
+            "How did you test your project and confirm it met its requirements?",
+            "If you could rebuild one part of your project, what would you change and why?",
+            "How did you divide a large project into manageable tasks?",
+            "Describe a project mistake or setback and what you learned from it.",
+            "How would you explain the value and outcome of your project to a non-technical stakeholder?",
+            "What would you improve first if your project had to support many more users?",
+            "How did you decide which features to complete first when time was limited?",
+        ],
+        "APIs, databases, and architecture": [
+            "Design a simple REST API for a resource and describe its endpoints and status codes.",
+            "How would you validate incoming API data and return useful error responses?",
+            "How would you design database tables for a simple user-and-orders application?",
+            "A database query becomes slow as data grows. How would you investigate and improve it?",
+            "Explain when you would use a database index and what trade-offs it introduces.",
+            "How would you handle authentication and authorization for a backend API?",
+            "How would you prevent duplicate records when a client retries a request?",
+            "How would you structure error handling and logging in a backend service?",
+            "How would you design an API that needs pagination and filtering for large results?",
+            "What would you consider when separating a growing application into modules or services?",
+        ],
+        "Communication and behavioral skills": [
+            "Tell me about a time you received critical feedback and how you responded.",
+            "Describe a disagreement with a teammate and how you worked toward a resolution.",
+            "How do you explain a technical delay to a stakeholder who is waiting for delivery?",
+            "Describe a time you had to prioritize competing tasks under a deadline.",
+            "Tell me about a mistake you made at work or in a project and what you learned.",
+            "How would you ask for help after being blocked on a task?",
+            "Describe how you keep teammates informed about progress and risks.",
+            "Tell me about a time you adapted after requirements changed.",
+            "How would you respond if you disagreed with a technical decision made by your team?",
+            "Describe a situation where you had to learn something quickly to complete a task.",
+        ],
+        "General interview skills": [
+            f"Give a concise introduction that connects your experience to a {role} role.",
+            "Describe a challenging task using a clear situation, action, and result structure.",
+            "How would you explain your strongest relevant skill with a concrete example?",
+            "What would you do if you did not know the answer to a technical interview question?",
+            "Describe how you make an answer clear without adding unnecessary detail.",
+            "How do you support claims about your work with specific evidence or outcomes?",
+            "What questions would you ask to clarify an ambiguous interview problem?",
+            "How do you explain the reasoning behind an answer, not just the conclusion?",
+            "Describe how you reflect on feedback after an interview or presentation.",
+            "How would you structure an answer when asked to compare two possible solutions?",
+        ],
+    }
+
+    templates = {
+        "Easy": [
+            f"Explain what {skill_text} means in the context of a {role} role.",
+            f"Which skill from your resume would be most useful as a {role}, and why?",
+            "Walk me through a project or task you completed and your contribution.",
+            f"What interests you most about working as a {role}?",
+            f"How would you describe your experience with {skill_text}?",
+        ],
+        "Medium": [
+            f"Describe a project where you applied {skill_text}. What was your contribution?",
+            f"How would you approach {role_topics[0]} in a real project?",
+            "Tell me about a difficult problem you encountered and how you debugged it.",
+            f"How would you apply {role_topics[1]} to improve an existing application or workflow?",
+            "How do you test your work and make sure changes have not introduced regressions?",
+            f"What trade-offs would you consider when working on {role_topics[2]}?",
+            "Describe a time you received feedback and how you used it to improve your work.",
+        ],
+        "Hard": [
+            f"Design a solution for a production-scale problem involving {role_topics[0]}. Explain your trade-offs.",
+            f"How would you diagnose and resolve a complex failure involving {role_topics[1]}?",
+            f"What architectural decisions would you make to improve scalability, reliability, and maintainability as a {role}?",
+            f"How would you evaluate competing approaches to {role_topics[2]}? Define your success metrics.",
+            "Describe a technical decision you would revisit after discovering a major limitation. How would you improve it?",
+            "How would you investigate a performance regression that cannot be reproduced consistently?",
+            "How would you balance delivery deadlines against technical debt and reliability risks?",
+        ],
+    }
+
+    if request.focus_category:
+        questions = focused_questions[request.focus_category][:request.count]
+        difficulty_prefix = {
+            "Easy": "Start with the basics: ",
+            "Medium": "Explain your reasoning and give a practical example: ",
+            "Hard": "Address trade-offs, edge cases, and verification: ",
+        }[request.difficulty]
+        questions = [difficulty_prefix + question for question in questions]
+    else:
+        questions = templates[request.difficulty][:request.count]
+
+    return {
+        "role": role,
+        "focus_category": request.focus_category,
+        "difficulty": request.difficulty,
+        "skills_used": skills,
+        "questions": [{"id": index + 1, "question": question} for index, question in enumerate(questions)],
+        "generation_method": "local_template",
+    }
+
+
+class AnswerItem(BaseModel):
+    question_id: int
+    question: str = Field(min_length=1, max_length=2000)
+    answer: str = Field(default="", max_length=10000)
+
+
+class EvaluationRequest(BaseModel):
+    role: str = Field(min_length=2, max_length=100)
+    responses: list[AnswerItem] = Field(min_length=1, max_length=10)
+
+
+def evaluate_answer(answer: str):
+    text = answer.strip()
+    words = text.split()
+    word_count = len(words)
+    lower = text.lower()
+
+    if not text:
+        return {
+            "score": 0,
+            "word_count": 0,
+            "strengths": [],
+            "suggestions": [
+                "Provide an answer before submitting this question."
+            ],
+            "breakdown": {
+                "completeness": 0,
+                "specificity": 0,
+                "reasoning": 0,
+            },
+        }
+
+    # 1. Completeness: measures response development, not correctness.
+    if word_count < 15:
+        completeness = 10
+    elif word_count < 40:
+        completeness = 20
+    elif word_count < 80:
+        completeness = 30
+    else:
+        completeness = 40
+
+    # 2. Specificity: looks for examples, actions, and outcomes.
+    specificity_markers = [
+        "for example", "for instance", "project", "built",
+        "implemented", "improved", "reduced", "increased",
+        "result", "measured", "percent", "%",
+    ]
+    specificity_hits = sum(
+        1 for marker in specificity_markers if marker in lower
+    )
+    specificity = min(specificity_hits * 5, 30)
+
+    # 3. Reasoning: looks for explanations and decision-making.
+    reasoning_markers = [
+        "because", "therefore", "first", "then", "finally",
+        "approach", "tested", "trade-off", "tradeoff",
+        "learned", "decision", "however",
+    ]
+    reasoning_hits = sum(
+        1 for marker in reasoning_markers if marker in lower
+    )
+    reasoning = min(reasoning_hits * 5, 30)
+
+    score = min(100, completeness + specificity + reasoning)
+    strengths = []
+    suggestions = []
+
+    improved_answer_tip = (
+        "Structure your answer using the STAR method: "
+        "describe the Situation, Task, Action, and Result. "
+        "Include specific actions you took and measurable outcomes "
+        "where possible."
+    )
+
+    if word_count >= 40:
+        strengths.append(
+            "You provided a reasonably developed response."
+        )
+    else:
+        suggestions.append(
+            "Expand your answer with context, actions, and outcomes."
+        )
+
+    if specificity_hits:
+        strengths.append(
+            "You included language suggesting examples or concrete details."
+        )
+    else:
+        suggestions.append(
+            "Include a specific project, action, or measurable result."
+        )
+
+    if reasoning_hits:
+        strengths.append(
+            "Your answer includes some reasoning or explanation."
+        )
+    else:
+        suggestions.append(
+            "Explain why you chose your approach and how you tested it."
+        )
+
+    if word_count >= 40 and specificity_hits and reasoning_hits:
+        suggestions.append(
+            "Keep your answer focused and connect your actions to the outcome."
+        )
+
+    return {
+        "score": score,
+        "word_count": word_count,
+        "strengths": strengths,
+        "suggestions": suggestions,
+        "breakdown": {
+            "completeness": completeness,
+            "specificity": specificity,
+            "reasoning": reasoning,
+        },
+        "improved_answer_tip": improved_answer_tip,
+    }
+
+
+def generate_sample_answer(question: str, answer: str) -> str:
+    """Create a simple answer-improvement example without external AI."""
+
+    if not answer.strip():
+        return (
+            "Start by explaining the situation, your responsibility, "
+            "the actions you would take, and the expected result. "
+            "Use a real example from your own experience."
+        )
+
+    return (
+        f"For the question '{question}', strengthen your response by "
+        "organizing it into four parts:\n\n"
+        "1. Situation: Briefly describe the relevant project or problem.\n"
+        "2. Task: Explain your responsibility or goal.\n"
+        f"3. Action: Describe specifically what you did. Your current "
+        f"answer begins: '{answer.strip()[:250]}'. Add the tools, "
+        "decisions, and steps you personally used.\n"
+        "4. Result: Explain the outcome, ideally with a measurable "
+        "impact, and what you learned.\n\n"
+        "Use only details that accurately reflect your experience."
+    )
+
+
+
+@app.post("/api/interview/evaluate")
+async def evaluate_interview(request: EvaluationRequest):
+    results = []
+    for item in request.responses:
+        evaluation = evaluate_answer(item.answer)
+        sample_answer = generate_sample_answer(
+            item.question,
+            item.answer,
+        )
+
+        results.append({
+            "question_id": item.question_id,
+            "question": item.question,
+            "answer": item.answer,
+            **evaluation,
+            "sample_answer": sample_answer,
+        })
+
+
+    overall_score = round(sum(item["score"] for item in results) / len(results))
+    return {
+        "role": request.role,
+        "overall_score": overall_score,
+        "evaluated_count": len(results),
+        "results": results,
+        "evaluation_method": "local_heuristic",
+        "notice": (
+            "This preliminary score measures answer length, specificity indicators, "
+            "and reasoning indicators. It does not verify factual correctness or fully "
+            "understand answer relevance."
+        ),
+    }
+
+class SaveSessionRequest(BaseModel):
+    role: str = Field(min_length=1, max_length=100)
+    difficulty: str = Field(default="Medium", max_length=20)
+    questions: list = Field(default_factory=list, max_length=10)
+    answers: list = Field(default_factory=list, max_length=10)
+    evaluation: dict | None = None
+
+
+@app.post("/api/interview/history")
+async def save_interview_history(request: SaveSessionRequest):
+    created_at = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO interview_sessions
+                (role, difficulty, questions_json, answers_json, evaluation_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                request.role,
+                request.difficulty,
+                json.dumps(request.questions),
+                json.dumps(request.answers),
+                json.dumps(request.evaluation) if request.evaluation is not None else None,
+                created_at,
+            ),
+        )
+        session_id = cursor.lastrowid
+
+    return {"id": session_id, "created_at": created_at, "message": "Interview session saved."}
+
+
+def _decode_json(value, fallback):
+    if value is None:
+        return fallback
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return fallback
+
+
+def _overall_score(evaluation):
+    if not isinstance(evaluation, dict):
+        return None
+    score = evaluation.get("overall_score")
+    try:
+        return float(score) if score is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+@app.get("/api/interview/history")
+async def get_interview_history():
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT id, role, difficulty, evaluation_json, created_at
+            FROM interview_sessions
+            ORDER BY created_at DESC, id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+    sessions = []
+    for row in rows:
+        evaluation = _decode_json(row["evaluation_json"], None)
+        sessions.append({
+            "id": row["id"],
+            "role": row["role"],
+            "difficulty": row["difficulty"],
+            "created_at": row["created_at"],
+            "overall_score": _overall_score(evaluation),
+        })
+    return {"sessions": sessions}
+
+
+@app.get("/api/interview/readiness")
+async def get_interview_readiness():
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT evaluation_json
+            FROM interview_sessions
+            ORDER BY created_at DESC, id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+    scores = []
+
+    for row in rows:
+        evaluation = _decode_json(row["evaluation_json"], None)
+        score = _overall_score(evaluation)
+
+        if score is not None:
+            scores.append(float(score))
+
+    if not scores:
+        return {
+            "readiness_score": 0,
+            "level": "Not assessed",
+            "evaluated_interviews": 0,
+            "recommendations": [
+                "Complete and evaluate an interview to begin tracking readiness."
+            ],
+        }
+
+    average_score = round(sum(scores) / len(scores))
+    latest_score = scores[0]
+
+    readiness_score = round(
+        average_score * 0.7 + latest_score * 0.3
+    )
+
+    if readiness_score >= 85:
+        level = "Interview ready"
+    elif readiness_score >= 70:
+        level = "Nearly ready"
+    elif readiness_score >= 50:
+        level = "Developing"
+    else:
+        level = "Needs practice"
+
+    recommendations = []
+
+    if average_score < 70:
+        recommendations.append(
+            "Practice explaining your approach and reasoning."
+        )
+
+    if latest_score < average_score:
+        recommendations.append(
+            "Your latest score was below your average. Review that interview's feedback."
+        )
+
+    if len(scores) < 3:
+        recommendations.append(
+            "Complete at least three evaluated interviews to build a broader performance picture."
+        )
+
+    if not recommendations:
+        recommendations.append(
+            "Continue practicing across different question types and difficulty levels."
+        )
+
+    return {
+        "readiness_score": readiness_score,
+        "level": level,
+        "evaluated_interviews": len(scores),
+        "average_score": average_score,
+        "latest_score": latest_score,
+        "recommendations": recommendations,
+    }
+
+
+@app.get("/api/interview/history/{session_id}")
+async def get_interview_history_detail(session_id: int):
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            """
+            SELECT id, role, difficulty, questions_json, answers_json,
+                   evaluation_json, created_at
+            FROM interview_sessions
+            WHERE id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="Interview session not found.")
+
+    return {
+        "id": row["id"],
+        "role": row["role"],
+        "difficulty": row["difficulty"],
+        "questions": _decode_json(row["questions_json"], []),
+        "answers": _decode_json(row["answers_json"], []),
+        "evaluation": _decode_json(row["evaluation_json"], None),
+        "created_at": row["created_at"],
+    }
+
+
+# Simple heuristic categories for weak-skill analysis.
+# These classify question topics; they do not verify technical correctness.
+WEAK_SKILL_CATEGORIES = {
+    "Technical fundamentals": [
+        "explain", "what is", "difference", "fundamental", "concept",
+        "data structure", "algorithm",
+    ],
+    "Problem solving and debugging": [
+        "debug", "problem", "diagnose", "resolve", "failure", "troubleshoot",
+        "performance regression",
+    ],
+    "Projects and practical experience": [
+        "project", "built", "implemented", "contribution", "experience",
+        "work you", "task you",
+    ],
+    "APIs, databases, and architecture": [
+        "api", "database", "query", "architecture", "scalability",
+        "application", "system design",
+    ],
+    "Communication and behavioral skills": [
+        "feedback", "team", "collaborat", "stakeholder", "communicat",
+        "prioritiz", "trade-off", "tradeoff", "learned",
+    ],
+}
+
+
+def classify_question(question: str) -> str:
+    lower = question.lower()
+    for category, keywords in WEAK_SKILL_CATEGORIES.items():
+        if any(keyword in lower for keyword in keywords):
+            return category
+    return "General interview skills"
+
+
+def get_category_recommendation(category: str, average_score: float) -> str:
+    """Return focused advice based on the category and answer-structure score."""
+    if average_score < 40:
+        recommendations = {
+            "Problem solving and debugging": (
+                "Practice explaining a debugging process step by step: reproduce the issue, "
+                "inspect logs or errors, test a hypothesis, and verify the fix."
+            ),
+            "APIs, databases, and architecture": (
+                "Review API request/response flows, common HTTP status codes, basic SQL queries, "
+                "and how you would explain a simple system design."
+            ),
+            "Projects and practical experience": (
+                "Prepare a project example that covers the goal, your personal contribution, "
+                "a technical challenge, the decision you made, and the outcome."
+            ),
+            "Technical fundamentals": (
+                "Choose core concepts relevant to your target role. Explain each in your own "
+                "words, compare it with a related concept, and give a small example."
+            ),
+            "Communication and behavioral skills": (
+                "Practice structured behavioral answers: describe the situation, your task, "
+                "the actions you took, and the result or lesson learned."
+            ),
+            "General interview skills": (
+                "Build each answer with a direct response, supporting reasoning, a concrete "
+                "example, and a brief conclusion. Avoid one-line answers."
+            ),
+        }
+        return recommendations.get(
+            category,
+            "Practice giving a complete answer with clear reasoning and a relevant example."
+        )
+
+    if average_score < 70:
+        return (
+            "Your answer structure can be clearer. Explain why you chose your approach, "
+            "include a concrete example, and describe how you checked the result."
+        )
+
+    return (
+        "Keep this area sharp with more challenging questions and realistic interview scenarios."
+    )
+
+
+@app.get("/api/interview/weak-skills")
+async def get_weak_skill_analysis():
+    """Summarize saved question scores by topic, using existing evaluation data."""
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT role, questions_json, evaluation_json, created_at
+            FROM interview_sessions
+            WHERE evaluation_json IS NOT NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+    aggregates = defaultdict(lambda: {"scores": [], "count": 0})
+    evaluated_sessions = 0
+
+    for row in rows:
+        evaluation = _decode_json(row["evaluation_json"], None)
+        if not isinstance(evaluation, dict):
+            continue
+        results = evaluation.get("results", [])
+        if not isinstance(results, list):
+            continue
+
+        session_had_score = False
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            try:
+                score = float(result.get("score"))
+            except (TypeError, ValueError):
+                continue
+            question = str(result.get("question", ""))
+            category = classify_question(question)
+            aggregates[category]["scores"].append(max(0, min(100, score)))
+            aggregates[category]["count"] += 1
+            session_had_score = True
+
+        if session_had_score:
+            evaluated_sessions += 1
+
+    categories = []
+    for category, data in aggregates.items():
+        scores = data["scores"]
+        average = round(sum(scores) / len(scores)) if scores else None
+        categories.append({
+            "category": category,
+            "average_score": average,
+            "question_count": data["count"],
+            "recommendation": (
+                get_category_recommendation(category, average)
+                if average is not None
+                else "Complete and evaluate more answers to receive a useful recommendation."
+            ),
+        })
+
+    categories.sort(
+        key=lambda item: (
+            item["average_score"] if item["average_score"] is not None else 101,
+            -item["question_count"],
+        )
+    )
+
+    return {
+        "evaluated_sessions": evaluated_sessions,
+        "categories": categories,
+        "notice": (
+            "This is a heuristic analysis based on question topics and the existing "
+            "answer-structure score. It does not assess factual correctness or prove "
+            "that a particular technical skill is weak."
+        ),
+    }
+
+
+
+@app.get("/api/interview/readiness")
+async def get_interview_readiness():
+    with sqlite3.connect(DB_PATH) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT evaluation_json
+            FROM interview_sessions
+            ORDER BY created_at DESC, id DESC
+            LIMIT 100
+            """
+        ).fetchall()
+
+    evaluated_sessions = []
+
+    for row in rows:
+        evaluation = _decode_json(row["evaluation_json"], None)
+        score = _overall_score(evaluation)
+
+        if score is not None:
+            evaluated_sessions.append({
+                "overall_score": score
+            })
+
+    if not evaluated_sessions:
+        return {
+            "readiness_score": 0,
+            "level": "Not assessed",
+            "evaluated_interviews": 0,
+            "recommendations": [
+                "Complete and evaluate an interview to begin tracking readiness."
+            ],
+        }
+
+    scores = [
+        float(session["overall_score"])
+        for session in evaluated_sessions
+    ]
+
+    average_score = round(sum(scores) / len(scores))
+    latest_score = scores[0]
+
+    readiness_score = round(
+        average_score * 0.7 + latest_score * 0.3
+    )
+
+    if readiness_score >= 85:
+        level = "Interview ready"
+    elif readiness_score >= 70:
+        level = "Nearly ready"
+    elif readiness_score >= 50:
+        level = "Developing"
+    else:
+        level = "Needs practice"
+
+    recommendations = []
+
+    if average_score < 70:
+        recommendations.append(
+            "Practice explaining your approach and the reasoning behind decisions."
+        )
+
+    if latest_score < average_score:
+        recommendations.append(
+            "Your latest score was below your average. Review that interview's feedback."
+        )
+
+    if len(evaluated_sessions) < 3:
+        recommendations.append(
+            "Complete at least three evaluated interviews for a broader performance picture."
+        )
+
+    if not recommendations:
+        recommendations.append(
+            "Keep practicing across different question types and difficulty levels."
+        )
+
+    return {
+        "readiness_score": readiness_score,
+        "level": level,
+        "evaluated_interviews": len(evaluated_sessions),
+        "average_score": average_score,
+        "latest_score": latest_score,
+        "recommendations": recommendations,
+    }
