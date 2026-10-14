@@ -983,3 +983,23 @@ async def get_weak_skill_analysis():
             "that a particular technical skill is weak."
         ),
     }
+
+
+
+@app.get("/api/diagnostics/database")
+def database_diagnostic():
+    database_type = "postgresql" if DATABASE_URL else "sqlite"
+
+    try:
+        with get_database_connection() as connection:
+            connection.execute("SELECT 1")
+
+        return {
+            "database": database_type,
+            "connection_ok": True,
+        }
+    except Exception:
+        return {
+            "database": database_type,
+            "connection_ok": False,
+        }
