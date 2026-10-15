@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { BrainCircuit, Mic, FileText, Code2 } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { BrainCircuit, Mic, FileText, Code2, Volume2 } from "lucide-react";
 import "./App.css";
 
 // const API = "http://127.0.0.1:8000";
@@ -46,6 +46,38 @@ type InterviewEvaluation = {
   notice: string;
 };
 
+type SpeechRecognitionResultLike = {
+  0: { transcript: string };
+  isFinal: boolean;
+};
+
+type SpeechRecognitionEventLike = {
+  resultIndex: number;
+  results: ArrayLike<SpeechRecognitionResultLike>;
+};
+
+type SpeechRecognitionErrorLike = {
+  error: string;
+};
+
+type SpeechRecognitionLike = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
+  onerror: ((event: SpeechRecognitionErrorLike) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+
+type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+
+type SpeechRecognitionWindow = Window & {
+  SpeechRecognition?: SpeechRecognitionConstructor;
+  webkitSpeechRecognition?: SpeechRecognitionConstructor;
+};
+
 export default function App() {
   const [status, setStatus] = useState("Checking backend...");
   const [questions, setQuestions] = useState<string[]>([]);
@@ -66,9 +98,7 @@ export default function App() {
 
   const loadReadiness = async () => {
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/interview/readiness`,
-      );
+      const response = await fetch(`${API_BASE_URL}/api/interview/readiness`);
 
       if (!response.ok) {
         throw new Error("Failed to load interview readiness.");
@@ -86,9 +116,7 @@ export default function App() {
     setHistoryError("");
 
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/interview/history`,
-      );
+      const response = await fetch(`${API_BASE_URL}/api/interview/history`);
 
       if (!response.ok) {
         throw new Error("Could not load interview history.");
@@ -276,21 +304,18 @@ export default function App() {
     setInterviewQuestions([]);
 
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/interview/generate`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            resume_text: resumeText,
-            role: `${targetRole} — focus on ${selectedSkill || "general interview skills"}`,
-            difficulty,
-            count: Number(questionCount),
-          }),
+      const response = await fetch(`${API_BASE_URL}/api/interview/generate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
         },
-      );
+        body: JSON.stringify({
+          resume_text: resumeText,
+          role: `${targetRole} — focus on ${selectedSkill || "general interview skills"}`,
+          difficulty,
+          count: Number(questionCount),
+        }),
+      });
 
       const data = await response.json();
 
@@ -319,6 +344,121 @@ export default function App() {
   const [interviewFinished, setInterviewFinished] = useState(false);
 
   const currentQuestion = interviewQuestions[currentQuestionIndex];
+  const [voiceStatus, setVoiceStatus] = useState("");
+  const [isListening, setIsListening] = useState(false);
+
+  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+
+  function speakCurrentQuestion() {
+    if (!currentQuestion?.question) return;
+
+    if (!("speechSynthesis" in window)) {
+      setVoiceStatus(
+        "Reading questions aloud is not supported in this browser.",
+      );
+      return;
+    }
+
+    window.speechSynthesis.cancel();
+
+    const utterance = new SpeechSynthesisUtterance(currentQuestion.question);
+    utterance.lang = "en-IN";
+
+    utterance.rate = 0.95;
+    utterance.onend = () => setVoiceStatus("");
+
+    utterance.onerror = () => {
+      setVoiceStatus("Could not read the question aloud.");
+    };
+
+    setVoiceStatus("Reading question aloud...");
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function stopVoiceAnswer() {
+    const recognition = recognitionRef.current;
+
+    if (recognition) {
+      setVoiceStatus("Stopping voice input...");
+      recognition.stop();
+    } else {
+      setIsListening(false);
+    }
+  }
+
+  function startVoiceAnswer() {
+    if (!currentQuestion) return;
+
+    const browserWindow = window as SpeechRecognitionWindow;
+    const Recognition =
+      browserWindow.SpeechRecognition ?? browserWindow.webkitSpeechRecognition;
+
+    if (!Recognition) {
+      setVoiceStatus(
+        "Speech recognition is unavailable in this browser. Please type your answer.",
+      );
+      return;
+    }
+
+    // Avoid starting more than one microphone session.
+    if (recognitionRef.current) return;
+
+    const questionId = currentQuestion.id;
+    const recognition = new Recognition();
+
+    recognition.lang = "en-IN";
+    recognition.continuous = true;
+    recognition.interimResults = true;
+
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) => result[0].transcript)
+        .join(" ")
+        .trim();
+
+      setAnswers((previous) => ({
+        ...previous,
+        [questionId]: transcript,
+      }));
+    };
+
+    recognition.onerror = (event) => {
+      recognitionRef.current = null;
+      setIsListening(false);
+      setVoiceStatus(
+        `Voice input error: ${event.error}. You can type your answer instead.`,
+      );
+    };
+
+    recognition.onend = () => {
+      recognitionRef.current = null;
+      setIsListening(false);
+      setVoiceStatus(
+        "Voice input stopped. Review your answer before continuing.",
+      );
+    };
+
+    recognitionRef.current = recognition;
+    setIsListening(true);
+    setVoiceStatus("Listening... Speak your answer.");
+
+    try {
+      recognition.start();
+    } catch {
+      recognitionRef.current = null;
+      setIsListening(false);
+      setVoiceStatus("Could not start voice input. Please try again.");
+    }
+  }
+
+  // Stop speech activity when this component unmounts.
+  useEffect(() => {
+    return () => {
+      recognitionRef.current?.stop();
+      recognitionRef.current = null;
+      window.speechSynthesis?.cancel();
+    };
+  }, []);
 
   function updateCurrentAnswer(value: string) {
     if (!currentQuestion) return;
@@ -330,6 +470,8 @@ export default function App() {
   }
 
   function startInterview() {
+    stopVoiceAnswer();
+    window.speechSynthesis?.cancel();
     if (interviewQuestions.length === 0) return;
 
     setCurrentQuestionIndex(0);
@@ -338,6 +480,8 @@ export default function App() {
   }
 
   function goToNextQuestion() {
+    stopVoiceAnswer();
+    window.speechSynthesis?.cancel();
     if (currentQuestionIndex < interviewQuestions.length - 1) {
       setCurrentQuestionIndex((index) => index + 1);
     } else {
@@ -346,6 +490,8 @@ export default function App() {
   }
 
   function goToPreviousQuestion() {
+    stopVoiceAnswer();
+    window.speechSynthesis?.cancel();
     setCurrentQuestionIndex((index) => Math.max(0, index - 1));
   }
 
@@ -363,23 +509,20 @@ export default function App() {
     setEvaluation(null);
 
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/interview/evaluate`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            role: targetRole,
-            responses: interviewQuestions.map((item) => ({
-              question_id: item.id,
-              question: item.question,
-              answer: answers[item.id] ?? "",
-            })),
-          }),
+      const response = await fetch(`${API_BASE_URL}/api/interview/evaluate`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
         },
-      );
+        body: JSON.stringify({
+          role: targetRole,
+          responses: interviewQuestions.map((item) => ({
+            question_id: item.id,
+            question: item.question,
+            answer: answers[item.id] ?? "",
+          })),
+        }),
+      });
 
       const data = await response.json();
 
@@ -1428,6 +1571,41 @@ export default function App() {
 
               <div className="current-question">
                 <h3>{currentQuestion?.question}</h3>
+
+                <div className="voice-controls">
+                  <button
+                    type="button"
+                    onClick={speakCurrentQuestion}
+                    disabled={!currentQuestion}
+                  >
+                    <Volume2 size={16} />
+                    Read Question Aloud
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={startVoiceAnswer}
+                    disabled={!currentQuestion || isListening}
+                  >
+                    <Mic size={16} />
+                    Start Speaking
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={stopVoiceAnswer}
+                    disabled={!isListening}
+                  >
+                    <span aria-hidden="true">Stop</span>
+                    Stop Listening
+                  </button>
+                </div>
+
+                {voiceStatus && (
+                  <p className="voice-status" role="status" aria-live="polite">
+                    {voiceStatus}
+                  </p>
+                )}
               </div>
 
               <label htmlFor="interview-answer">Your answer</label>
@@ -1635,80 +1813,81 @@ export default function App() {
 
                   {evaluation && (
                     <div className="evaluation-feedback">
-                    <h3>Evaluation Feedback</h3>
-                    <p>
-                      <strong>Role:</strong>{" "}
-                      {evaluation?.role ?? "Not available"}
-                    </p>
+                      <h3>Evaluation Feedback</h3>
+                      <p>
+                        <strong>Role:</strong>{" "}
+                        {evaluation?.role ?? "Not available"}
+                      </p>
 
-                    <p>
-                      <strong>Overall Score:</strong>{" "}
-                      {evaluation?.overall_score ?? "Not available"} / 100
-                    </p>
+                      <p>
+                        <strong>Overall Score:</strong>{" "}
+                        {evaluation?.overall_score ?? "Not available"} / 100
+                      </p>
 
-                    <p>
-                      <strong>Questions Evaluated:</strong>{" "}
-                      {evaluation?.evaluated_count ?? 0}
-                    </p>
+                      <p>
+                        <strong>Questions Evaluated:</strong>{" "}
+                        {evaluation?.evaluated_count ?? 0}
+                      </p>
 
-                    {evaluation?.results?.map((result: any) => (
-                      <div
-                        className="evaluation-result"
-                        key={result.question_id}
-                      >
-                        <h4>Question {result.question_id}</h4>
-                        <p>
-                          <strong>Question:</strong> {result.question}
-                        </p>
-                        <p>
-                          <strong>Your answer:</strong>{" "}
-                          {result.answer || "No answer provided."}
-                        </p>
-                        <p>
-                          <strong>Score:</strong> {result.score}/100
-                        </p>
+                      {evaluation?.results?.map((result: any) => (
+                        <div
+                          className="evaluation-result"
+                          key={result.question_id}
+                        >
+                          <h4>Question {result.question_id}</h4>
+                          <p>
+                            <strong>Question:</strong> {result.question}
+                          </p>
+                          <p>
+                            <strong>Your answer:</strong>{" "}
+                            {result.answer || "No answer provided."}
+                          </p>
+                          <p>
+                            <strong>Score:</strong> {result.score}/100
+                          </p>
 
-                        <h5>Strengths</h5>
-                        {result.strengths?.length ? (
+                          <h5>Strengths</h5>
+                          {result.strengths?.length ? (
+                            <ul>
+                              {result.strengths.map(
+                                (item: string, index: number) => (
+                                  <li key={index}>{item}</li>
+                                ),
+                              )}
+                            </ul>
+                          ) : (
+                            <p>Keep practising to develop stronger answers.</p>
+                          )}
+
+                          <h5>Suggestions</h5>
                           <ul>
-                            {result.strengths.map(
+                            {result.suggestions?.map(
                               (item: string, index: number) => (
                                 <li key={index}>{item}</li>
                               ),
                             )}
                           </ul>
-                        ) : (
-                          <p>Keep practising to develop stronger answers.</p>
-                        )}
 
-                        <h5>Suggestions</h5>
-                        <ul>
-                          {result.suggestions?.map(
-                            (item: string, index: number) => (
-                              <li key={index}>{item}</li>
-                            ),
+                          {result.breakdown && (
+                            <div>
+                              <h5>Score Breakdown</h5>
+                              <p>
+                                Completeness: {result.breakdown.completeness}/40
+                              </p>
+                              <p>
+                                Specificity: {result.breakdown.specificity}/30
+                              </p>
+                              <p>Reasoning: {result.breakdown.reasoning}/30</p>
+                            </div>
                           )}
-                        </ul>
+                        </div>
+                      ))}
 
-                        {result.breakdown && (
-                          <div>
-                            <h5>Score Breakdown</h5>
-                            <p>
-                              Completeness: {result.breakdown.completeness}/40
-                            </p>
-                            <p>
-                              Specificity: {result.breakdown.specificity}/30
-                            </p>
-                            <p>Reasoning: {result.breakdown.reasoning}/30</p>
-                          </div>
-                        )}
-                      </div>
-                    ))}
-
-                    {evaluation?.notice && (
-                      <p className="evaluation-notice">{evaluation.notice}</p>
-                    )}
-                  </div>)}
+                      {evaluation?.notice && (
+                        <p className="evaluation-notice">{evaluation.notice}</p>
+                      )}
+                    </div>
+                  )}
                 </>
               )}
             </section>
