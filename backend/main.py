@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 import json
+import time
 import re
 import sqlite3
 
@@ -17,8 +18,19 @@ import os
 import psycopg
 from psycopg.rows import dict_row
 
+from google import genai
+
 DB_PATH = Path(__file__).with_name("interviewpilot.db")
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+
+gemini_client = (
+    genai.Client(api_key=GEMINI_API_KEY)
+    if GEMINI_API_KEY
+    else None
+)
 
 
 
@@ -542,6 +554,185 @@ def evaluate_answer(answer: str):
     }
 
 
+def evaluate_answer_with_ai(
+    role: str,
+    question: str,
+    answer: str,
+) -> dict:
+    """Evaluate an interview answer with Gemini; fall back if unavailable."""
+
+    fallback = evaluate_answer(answer)
+
+    if gemini_client is None:
+        print(
+            "Gemini unavailable: gemini_client is None. "
+            "Check GEMINI_API_KEY and backend startup configuration.",
+            flush=True,
+        )
+        return {
+            **fallback,
+            "evaluator": "local_heuristic",
+        }
+
+    if not answer.strip():
+        print(
+            "Gemini skipped: the submitted answer is empty.",
+            flush=True,
+        )
+        return {
+            **fallback,
+            "evaluator": "local_heuristic",
+        }
+
+    prompt = f"""
+You are an experienced interviewer evaluating a candidate's answer.
+
+Target role: {role}
+Interview question: {question}
+Candidate's answer: {answer}
+
+Evaluate the answer based on:
+1. Completeness: Does it address the question?
+2. Specificity: Does it include relevant examples or details?
+3. Reasoning: Is the explanation logical and well-supported?
+4. Technical accuracy and relevance: Are claims accurate and relevant
+   to the question? Do not reward unsupported claims.
+5. Communication: Is the answer clear and well organized?
+
+Be fair to junior candidates. Do not reward length alone.
+Do not invent experience or facts about the candidate.
+If correctness cannot be established from the available context,
+say so in the suggestions rather than guessing.
+
+Return ONLY a valid JSON object with this exact structure:
+{{
+  "score": 0,
+  "strengths": ["specific strength"],
+  "suggestions": ["specific improvement"],
+  "breakdown": {{
+    "completeness": 0,
+    "specificity": 0,
+    "reasoning": 0
+  }},
+  "improved_answer_tip": "Actionable advice for improving this answer."
+}}
+
+Scoring rules:
+- Overall score: integer from 0 to 100.
+- Each breakdown score: integer from 0 to 40 for completeness,
+  0 to 30 for specificity, and 0 to 30 for reasoning.
+- The overall score should reflect all five evaluation criteria,
+  including technical accuracy and relevance.
+- Strengths and suggestions must be specific to this answer.
+- Do not treat keyword presence alone as evidence of correctness.
+"""
+
+    
+    last_error = None
+
+    for attempt in range(3):
+        try:
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "temperature": 0.2,
+                },
+            )
+
+            data = json.loads(response.text or "")
+
+            score = data["score"]
+            breakdown = data["breakdown"]
+            strengths = data["strengths"]
+            suggestions = data["suggestions"]
+            improved_answer_tip = data["improved_answer_tip"]
+
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, int)
+                or not 0 <= score <= 100
+            ):
+                raise ValueError("Invalid AI score")
+
+            limits = {
+                "completeness": 40,
+                "specificity": 30,
+                "reasoning": 30,
+            }
+
+            validated_breakdown = {}
+            for key, maximum in limits.items():
+                value = breakdown[key]
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not 0 <= value <= maximum
+                ):
+                    raise ValueError("Invalid AI breakdown")
+                validated_breakdown[key] = value
+
+            if (
+                not isinstance(strengths, list)
+                or not all(isinstance(item, str) for item in strengths)
+                or not isinstance(suggestions, list)
+                or not all(isinstance(item, str) for item in suggestions)
+                or not isinstance(improved_answer_tip, str)
+            ):
+                raise ValueError("Invalid AI feedback")
+
+            return {
+                "score": score,
+                "word_count": len(answer.split()),
+                "strengths": strengths[:6],
+                "suggestions": suggestions[:6],
+                "breakdown": validated_breakdown,
+                "improved_answer_tip": improved_answer_tip,
+                "evaluator": "gemini",
+            }
+
+        except Exception as exc:
+            last_error = exc
+            error_text = str(exc)
+
+            # Retry only errors that may be temporary.
+            is_temporary = any(
+                marker in error_text
+                for marker in (
+                    "503",
+                    "UNAVAILABLE",
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "500",
+                    "INTERNAL",
+                    "502",
+                    "504",
+                    "DEADLINE_EXCEEDED",
+                    "408",
+                )
+            )
+
+            if is_temporary and attempt < 2:
+                delay = 2 ** attempt
+                print(
+                    f"Gemini temporary error; retrying in {delay}s "
+                    f"(attempt {attempt + 1}/3)."
+                )
+                time.sleep(delay)
+                continue
+
+            break
+
+    print(
+        f"Gemini evaluation failed; using fallback. "
+        f"Error type: {type(last_error).__name__}; "
+        f"Error: {last_error!r}",
+        flush=True,
+    )
+
+
+
 def generate_sample_answer(question: str, answer: str) -> str:
     """Create a simple answer-improvement example without external AI."""
 
@@ -567,11 +758,18 @@ def generate_sample_answer(question: str, answer: str) -> str:
 
 
 
+
 @app.post("/api/interview/evaluate")
 async def evaluate_interview(request: EvaluationRequest):
     results = []
+
     for item in request.responses:
-        evaluation = evaluate_answer(item.answer)
+        evaluation = evaluate_answer_with_ai(
+            request.role,
+            item.question,
+            item.answer,
+        )
+
         sample_answer = generate_sample_answer(
             item.question,
             item.answer,
@@ -585,19 +783,45 @@ async def evaluate_interview(request: EvaluationRequest):
             "sample_answer": sample_answer,
         })
 
+    overall_score = (
+        round(sum(item["score"] for item in results) / len(results))
+        if results
+        else 0
+    )
 
-    overall_score = round(sum(item["score"] for item in results) / len(results))
+    # Report the evaluator actually used for each answer.
+    evaluator_types = {
+        item.get("evaluator", "local_heuristic")
+        for item in results
+    }
+
+    if evaluator_types == {"gemini"}:
+        evaluation_method = "gemini"
+        notice = (
+            "Answers were evaluated using Gemini AI. Scores are estimates "
+            "and may not always reflect factual correctness."
+        )
+    elif "gemini" in evaluator_types:
+        evaluation_method = "mixed"
+        notice = (
+            "Some answers were evaluated using Gemini AI and others using "
+            "the local heuristic evaluator. Review individual results for details."
+        )
+    else:
+        evaluation_method = "local_heuristic"
+        notice = (
+            "This preliminary score uses answer length, specificity indicators, "
+            "and reasoning indicators. It does not fully verify factual correctness "
+            "or understand answer relevance."
+        )
+
     return {
         "role": request.role,
         "overall_score": overall_score,
         "evaluated_count": len(results),
         "results": results,
-        "evaluation_method": "local_heuristic",
-        "notice": (
-            "This preliminary score measures answer length, specificity indicators, "
-            "and reasoning indicators. It does not verify factual correctness or fully "
-            "understand answer relevance."
-        ),
+        "evaluation_method": evaluation_method,
+        "notice": notice,
     }
 
 class SaveSessionRequest(BaseModel):

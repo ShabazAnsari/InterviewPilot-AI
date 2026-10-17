@@ -339,11 +339,40 @@ export default function App() {
 
   // Interview Session
 
+  // Interview Session
+
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [answers, setAnswers] = useState<Record<number, string>>({});
   const [interviewFinished, setInterviewFinished] = useState(false);
 
+  // Real-time interview timer
+  const QUESTION_TIME_LIMIT = 120; // 2 minutes per question
+
+  const [timeLeft, setTimeLeft] = useState(QUESTION_TIME_LIMIT);
+  const [timerRunning, setTimerRunning] = useState(false);
+
   const currentQuestion = interviewQuestions[currentQuestionIndex];
+
+  useEffect(() => {
+    if (!timerRunning || interviewFinished || interviewQuestions.length === 0) {
+      return;
+    }
+
+    const timerId = window.setInterval(() => {
+      setTimeLeft((previous) => Math.max(0, previous - 1));
+    }, 1000);
+
+    return () => window.clearInterval(timerId);
+  }, [timerRunning, interviewFinished, interviewQuestions.length]);
+
+  useEffect(() => {
+    if (timeLeft === 0) {
+      setTimerRunning(false);
+      stopVoiceAnswer();
+      setVoiceStatus("Time is up. Review your answer before continuing.");
+    }
+  }, [timeLeft]);
+
   const [voiceStatus, setVoiceStatus] = useState("");
   const [isListening, setIsListening] = useState(false);
 
@@ -477,6 +506,8 @@ export default function App() {
     setCurrentQuestionIndex(0);
     setAnswers({});
     setInterviewFinished(false);
+    setTimeLeft(QUESTION_TIME_LIMIT);
+    setTimerRunning(true);
   }
 
   function goToNextQuestion() {
@@ -484,8 +515,11 @@ export default function App() {
     window.speechSynthesis?.cancel();
     if (currentQuestionIndex < interviewQuestions.length - 1) {
       setCurrentQuestionIndex((index) => index + 1);
+      setTimeLeft(QUESTION_TIME_LIMIT);
+      setTimerRunning(true);
     } else {
       setInterviewFinished(true);
+      setTimerRunning(false);
     }
   }
 
@@ -493,6 +527,8 @@ export default function App() {
     stopVoiceAnswer();
     window.speechSynthesis?.cancel();
     setCurrentQuestionIndex((index) => Math.max(0, index - 1));
+    setTimeLeft(QUESTION_TIME_LIMIT);
+    setTimerRunning(true);
   }
 
   const [evaluation, setEvaluation] = useState<InterviewEvaluation | null>(
@@ -1565,9 +1601,46 @@ export default function App() {
           ) : (
             <>
               <div className="interview-progress">
-                Question {currentQuestionIndex + 1} of{" "}
-                {interviewQuestions.length}
+                <span>
+                  Question {currentQuestionIndex + 1} of{" "}
+                  {interviewQuestions.length}
+                </span>
+
+                <strong>
+                  {Math.floor(timeLeft / 60)}:
+                  {String(timeLeft % 60).padStart(2, "0")}
+                </strong>
               </div>
+
+              <div
+                className="timer-track"
+                role="progressbar"
+                aria-label="Time remaining"
+                aria-valuemin={0}
+                aria-valuemax={QUESTION_TIME_LIMIT}
+                aria-valuenow={timeLeft}
+              >
+                <div
+                  className={`timer-fill ${timeLeft <= 15 ? "timer-warning" : ""}`}
+                  style={{
+                    width: `${(timeLeft / QUESTION_TIME_LIMIT) * 100}%`,
+                  }}
+                />
+              </div>
+
+              {timeLeft <= 15 && timeLeft > 0 && (
+                <p className="timer-message" role="status">
+                  Time is running out!
+                </p>
+              )}
+
+              <button
+                type="button"
+                onClick={() => setTimerRunning((running) => !running)}
+                disabled={timeLeft === 0}
+              >
+                {timerRunning ? "Pause Timer" : "Resume Timer"}
+              </button>
 
               <div className="current-question">
                 <h3>{currentQuestion?.question}</h3>
